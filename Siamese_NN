@@ -1,0 +1,184 @@
+# This script contains the code for ImageCLEFmedical 2025 GANs task - Subtask 1 and Subtask 2
+import os
+import random
+import numpy as np
+import tensorflow as tf
+from collections import defaultdict
+import keras.backend as K
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+from tensorflow.keras.applications import EfficientNetB0
+from tensorflow.keras import layers, models, optimizers, Model
+from tensorflow.keras.preprocessing import image
+# from tensorflow.keras.model import Model
+IMG_SIZE     = (256,256)
+BATCH_SIZE   = 32 #32
+EPOCHS= 50
+NUM_CLASSES  = 5
+TRAIN_REAL_DIR  = "E:/ImageCLEF GANs 2025/train dataset/GAN25_Identify_Training_Data_Subset/real"
+TRAIN_GEN_DIR   = "E:/ImageCLEF GANs 2025/train dataset/GAN25_Identify_Training_Data_Subset/generated" #generated
+TEST_DIR        = "E:/ImageCLEF GANs 2025/test_dataset/Subtask2/Subtask2/Subtask2_test/generated_unknown"   # all unlabeled test images here
+OUTPUT_CSV      = "E:/ImageCLEF GANs 2025/test_dataset/Subtask2/Subtask2/Subtask2_test/r_1.csv"
+
+print("Real root contents:", os.listdir(TRAIN_REAL_DIR))
+for cls in sorted(os.listdir(TRAIN_REAL_DIR)):
+    p = os.path.join(TRAIN_REAL_DIR, cls)
+    if os.path.isdir(p):
+        print(f"  {cls} →", os.listdir(p))
+print()
+print("Generated root contents:", os.listdir(TRAIN_GEN_DIR))
+for cls in sorted(os.listdir(TRAIN_GEN_DIR)):
+    p = os.path.join(TRAIN_GEN_DIR, cls)
+    if os.path.isdir(p):
+        print(f"  {cls} →", os.listdir(p))
+print()
+
+
+class_names  = sorted([
+    d for d in os.listdir(TRAIN_REAL_DIR)
+    if os.path.isdir(os.path.join(TRAIN_REAL_DIR, d))
+])
+class_to_idx = {name: idx for idx, name in enumerate(class_names)}
+
+print("Found classes:", class_names)
+
+def gather_files_by_class(base_dir, class_to_idx):
+    files_by_class = defaultdict(list)
+    for root, _, files in os.walk(base_dir):
+        rel = os.path.relpath(root, base_dir)   # e.g. 't3' or 't3/sub'
+        top = rel.split(os.sep)[0]
+        if top not in class_to_idx:
+            continue
+        cls_idx = class_to_idx[top]
+        for fn in files:
+            if fn.lower().endswith((".jpg", "jpeg", "png")):
+                files_by_class[cls_idx].append(os.path.join(root, fn))
+    return files_by_class
+
+real_by_class = gather_files_by_class(TRAIN_REAL_DIR, class_to_idx)
+gen_by_class  = gather_files_by_class(TRAIN_GEN_DIR,  class_to_idx)
+
+valid_classes = [c for c in class_to_idx.values()
+                 if real_by_class[c] and gen_by_class[c]]
+
+if not valid_classes:
+    raise RuntimeError("No class has both real and generated images! Check your folders.")
+
+dropped = set(class_to_idx.values()) - set(valid_classes)
+if dropped:
+    print("Warning: dropping classes with no data:", [class_names[c] for c in dropped])
+
+print("Valid classes:", [class_names[c] for c in valid_classes])
+
+neg_pairs = [(c1, c2)
+             for c1 in valid_classes for c2 in valid_classes if c1 != c2]
+
+def pair_generator():
+    while True:
+        # half positives
+        for _ in range(BATCH_SIZE // 2):
+            c = random.choice(valid_classes)
+            yield ( random.choice(real_by_class[c]),
+                    random.choice(gen_by_class[c]),
+                    1 )
+        # half negatives
+        for _ in range(BATCH_SIZE - BATCH_SIZE // 2):
+            c1, c2 = random.choice(neg_pairs)
+            yield ( random.choice(real_by_class[c1]),
+                    random.choice(gen_by_class[c2]),
+                    0 )
+
+ds = tf.data.Dataset.from_generator(
+    pair_generator,
+    output_types=(tf.string, tf.string, tf.int32),
+    output_shapes=((),(),())
+)
+
+def _load_and_preprocess(pathA, pathB, label):
+    def _load(path):
+        img = tf.io.read_file(path)
+        img = tf.image.decode_image(img, channels=1)
+        # img = tf.image.resize(img, IMG_SIZE)
+        return img #/ 255.0
+    return (_load(pathA), _load(pathB)), tf.cast(label, tf.float32)
+
+ds = (ds
+      .map(_load_and_preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+      .batch(BATCH_SIZE)
+      .prefetch(tf.data.AUTOTUNE))
+
+@tf.autograph.experimental.do_not_convert
+def contrastive_loss(y_true, y_pred):
+    margin = tf.constant(1.0)                 # bind margin locally
+    sq_pred     = tf.square(y_pred)
+    margin_pred = tf.maximum(margin - y_pred, 0)
+    msq         = tf.square(margin_pred)
+    return tf.reduce_mean(y_true * sq_pred + (1 - y_true) * msq)
+def build_embedding_net(input_shape=(*IMG_SIZE,1)):  # original
+    inp = layers.Input(input_shape)
+    # x   = layers.Conv2D(4, 3, activation="relu", padding="same")(inp)
+    # x   = layers.MaxPool2D()(x)
+    # x   = layers.Conv2D(8, 3, activation="relu", padding="same")(inp)
+    # x   = layers.MaxPool2D()(x)
+    x = layers.Conv2D(16, 3, activation="relu")(inp)
+    x   = layers.MaxPool2D()(x)
+    x = layers.Conv2D(32,3,activation="relu")(x)
+    x = layers.MaxPool2D()(x)
+    x = layers.Conv2D(64,3,activation="relu")(x)
+    x = layers.MaxPool2D()(x)
+    x = layers.Conv2D(128,3,activation="relu")(x)
+    x = layers.MaxPool2D()(x)
+    x = layers.Flatten()(x)
+    x = layers.Dense(256, activation="relu")(x)
+    x = layers.Lambda(lambda t: tf.math.l2_normalize(t, axis=1))(x)
+    return models.Model(inp, x, name="embed_net")
+embed_net = build_embedding_net()
+
+inpA = tf.keras.Input((*IMG_SIZE, 1))
+inpB = tf.keras.Input((*IMG_SIZE, 1))
+embA = embed_net(inpA)
+embB = embed_net(inpB)
+distance = layers.Lambda(
+    lambda t: K.sqrt(K.sum(K.square(t[0] - t[1]), axis=1, keepdims=True))
+)([embA, embB])
+
+
+siamese = Model([inpA, inpB], distance, name="siamese")
+siamese.compile(
+    optimizer=tf.keras.optimizers.Adam(1e-4), #0.001
+    loss=contrastive_loss #.keras.losses.binary_crossentropy
+)
+siamese.summary()
+
+steps = (sum(len(real_by_class[c]) for c in valid_classes) // BATCH_SIZE) or 1
+siamese.fit(ds, epochs=EPOCHS, steps_per_epoch=steps)
+all_real_paths = [p for c in valid_classes for p in real_by_class[c]]
+all_real_imgs  = tf.stack([
+    tf.image.resize(tf.image.decode_image(tf.io.read_file(p), channels=1), IMG_SIZE)/255.0
+    for p in all_real_paths
+], axis=0)
+all_real_embs = embed_net.predict(all_real_imgs, batch_size=BATCH_SIZE)
+
+centroids = {}
+idx = 0
+for c in valid_classes:
+    n = len(real_by_class[c])
+    centroids[c] = np.mean(all_real_embs[idx:idx+n], axis=0)
+    idx += n
+
+test_files = [
+    os.path.join(r, f)
+    for r, _, files in os.walk(TEST_DIR)
+    for f in files if f.lower().endswith((".jpg","jpeg","png"))
+]
+
+with open(OUTPUT_CSV, "w") as fout:
+    fout.write("image_path,predicted_class\n")
+    for p in test_files:
+        img = tf.image.resize(tf.image.decode_image(tf.io.read_file(p), channels=1), IMG_SIZE)/255.0
+        emb = embed_net.predict(tf.expand_dims(img,0))[0]
+        dists = {c: np.linalg.norm(emb - centroids[c]) for c in valid_classes}
+        pred = min(dists, key=dists.get)
+        fout.write(f"{p},{class_names[pred]}\n")
+
+print("Done – predictions saved to", OUTPUT_CSV)
