@@ -1,6 +1,6 @@
 #This script contains the code for ImageCLEFmedical 2025 GANs task - Subtask 2
 
- Method 1 : Feature extraction using a pre-trained models and clustering using both k-means and hierachical clustering - agglomerative clustering
+ # Method 1 : Feature extraction using a pre-trained models and clustering using both k-means and hierachical clustering - agglomerative clustering
 
 from sklearn.cluster import AgglomerativeClustering
 from tensorflow.keras.preprocessing import image
